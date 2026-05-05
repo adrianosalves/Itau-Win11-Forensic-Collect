@@ -12,7 +12,7 @@
 .PARAMETER HoursBack
     Período (em horas) para filtrar logs do Windows. Padrão: 72
 .NOTES
-    Autor   : [Seu Nome/Handle GitHub]
+    Autor   : [Adriano Alves]
     Versão  : 1.0.1 (Corrigido conflito PSPath)
     Data    : 2026-05-06
     Licença : MIT
