@@ -3,8 +3,9 @@
     Coleta automatizada de evidências forenses para estações Windows 10/11 sinalizadas pelo Banco Itaú.
 .DESCRIPTION
     Ferramenta de resposta a incidentes que coleta, de forma somente leitura, artefatos do sistema,
-    logs do Windows, estado de rede, recursos de segurança e pontos de persistência relacionados
-    ao ambiente do App Itaú. O output é compactado e preparado para envio seguro à equipe de TI/banco.
+    logs do Windows, estado de rede (com processos, caminhos e hashes), recursos de segurança e 
+    pontos de persistência relacionados ao ambiente do App Itaú. O output é compactado e preparado 
+    para envio seguro à equipe de TI/banco.
 .PARAMETER OutputPath
     Caminho personalizado para salvar as evidências. Padrão: $env:TEMP\Itau_Forensics_<Timestamp>
 .PARAMETER RetainUnpacked
@@ -12,8 +13,8 @@
 .PARAMETER HoursBack
     Período (em horas) para filtrar logs do Windows. Padrão: 72
 .NOTES
-    Autor   : [Adriano Alves]
-    Versão  : 1.0.1 (Corrigido conflito PSPath)
+    Autor   : [Seu Nome/Handle GitHub]
+    Versão  : 1.0.2 (Rede avançada: Processos + Caminhos + Hashes SHA256)
     Data    : 2026-05-06
     Licença : MIT
     AVISO   : FERRAMENTA DE USO EXCLUSIVO EM AMBIENTES CORPORATIVOS AUTORIZADOS.
@@ -68,20 +69,14 @@ try {
             Format-Table | Out-File (Join-Path $BaseDir "01_SysBrief.txt") -Encoding UTF8
         $Summary.Add("✅ System Info: OK")
     }
-    catch {
-        Log-Step "ERRO 1/8" "Falha ao coletar systeminfo: $($_.Exception.Message)" -Warn
-        $Summary.Add("⚠️  System Info: Parcial")
-    }
+    catch { Log-Step "ERRO 1/8" "Falha ao coletar systeminfo: $($_.Exception.Message)" -Warn; $Summary.Add("⚠️  System Info: Parcial") }
     #endregion
 
     #region 2. App Itaú
     Log-Step "2/8" "Mapeando artefatos do App Itaú..."
     try {
         $ItauReport = @()
-        $SearchPaths = @(
-            "$env:ProgramFiles\Itaú", "${env:ProgramFiles(x86)}\Itaú",
-            "$env:LOCALAPPDATA\Itaú", "$env:APPDATA\Itaú"
-        )
+        $SearchPaths = @("$env:ProgramFiles\Itaú", "${env:ProgramFiles(x86)}\Itaú", "$env:LOCALAPPDATA\Itaú", "$env:APPDATA\Itaú")
         $FoundExe = $null
         foreach ($p in $SearchPaths) {
             if (Test-Path $p) {
@@ -90,45 +85,21 @@ try {
             }
         }
         if ($FoundExe) {
-            $ItauReport += [PSCustomObject]@{
-                Path = $FoundExe.FullName
-                SHA256 = (Get-FileHash $FoundExe.FullName -Algorithm SHA256).Hash
-                Version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($FoundExe.FullName).FileVersion
-                Modified = $FoundExe.LastWriteTimeUtc
-            }
+            $ItauReport += [PSCustomObject]@{ Path=$FoundExe.FullName; SHA256=(Get-FileHash $FoundExe.FullName -Algorithm SHA256).Hash; Version=[System.Diagnostics.FileVersionInfo]::GetVersionInfo($FoundExe.FullName).FileVersion; Modified=$FoundExe.LastWriteTimeUtc }
         }
         Get-AppxPackage -Name "*Itau*" -ErrorAction SilentlyContinue | ForEach-Object {
-            $ItauReport += [PSCustomObject]@{
-                Path = $_.InstallLocation
-                SHA256 = $null
-                Version = $_.Version
-                Modified = $_.InstallDate
-            }
+            $ItauReport += [PSCustomObject]@{ Path=$_.InstallLocation; SHA256=$null; Version=$_.Version; Modified=$_.InstallDate }
         }
-        if ($ItauReport) {
-            $ItauReport | Format-List | Out-File (Join-Path $BaseDir "02_ItauApp_Details.txt") -Encoding UTF8
-        } else {
-            "Nenhum artefato do App Itaú encontrado nos caminhos padrão." | Out-File (Join-Path $BaseDir "02_ItauApp_Details.txt") -Encoding UTF8
-        }
+        if ($ItauReport) { $ItauReport | Format-List | Out-File (Join-Path $BaseDir "02_ItauApp_Details.txt") -Encoding UTF8 } 
+        else { "Nenhum artefato do App Itaú encontrado nos caminhos padrão." | Out-File (Join-Path $BaseDir "02_ItauApp_Details.txt") -Encoding UTF8 }
         
         $AllFiles = @()
-        foreach ($p in $SearchPaths) {
-            if (Test-Path $p) {
-                $AllFiles += Get-ChildItem -Path $p -Recurse -Force -ErrorAction SilentlyContinue
-            }
-        }
-        if ($AllFiles) {
-            $AllFiles | Select-Object FullName, Length, LastWriteTime, Attributes |
-                Export-Csv (Join-Path $BaseDir "02_ItauApp_Files.csv") -NoTypeInformation -Encoding UTF8
-        } else {
-            "Nenhum arquivo encontrado." | Out-File (Join-Path $BaseDir "02_ItauApp_Files.csv") -Encoding UTF8
-        }
+        foreach ($p in $SearchPaths) { if (Test-Path $p) { $AllFiles += Get-ChildItem -Path $p -Recurse -Force -ErrorAction SilentlyContinue } }
+        if ($AllFiles) { $AllFiles | Select-Object FullName, Length, LastWriteTime, Attributes | Export-Csv (Join-Path $BaseDir "02_ItauApp_Files.csv") -NoTypeInformation -Encoding UTF8 }
+        else { "Nenhum arquivo encontrado." | Out-File (Join-Path $BaseDir "02_ItauApp_Files.csv") -Encoding UTF8 }
         $Summary.Add("✅ Itaú App: $(if($FoundExe){'Desktop Found'}else{'Store/None'})")
     }
-    catch {
-        Log-Step "ERRO 2/8" "Falha ao mapear app Itaú: $($_.Exception.Message)" -Warn
-        $Summary.Add("⚠️  Itaú App: Parcial")
-    }
+    catch { Log-Step "ERRO 2/8" "Falha ao mapear app Itaú: $($_.Exception.Message)" -Warn; $Summary.Add("⚠️  Itaú App: Parcial") }
     #endregion
 
     #region 3. Logs Windows
@@ -145,26 +116,60 @@ try {
             Export-Csv (Join-Path $BaseDir "03_WinEvents_Security.csv") -NoTypeInformation -Encoding UTF8
         $Summary.Add("✅ Windows Events: OK")
     }
-    catch {
-        Log-Step "ERRO 3/8" "Falha ao exportar logs: $($_.Exception.Message)" -Warn
-        $Summary.Add("⚠️  Windows Events: Parcial")
-    }
+    catch { Log-Step "ERRO 3/8" "Falha ao exportar logs: $($_.Exception.Message)" -Warn; $Summary.Add("⚠️  Windows Events: Parcial") }
     #endregion
 
-    #region 4. Rede
-    Log-Step "4/8" "Coletando estado de rede e DNS..."
+    #region 4. Rede Avançada (Processos + Caminhos + Hashes)
+    Log-Step "4/8" "Coletando conexões de rede com processos, caminhos e hashes SHA256..."
     try {
-        netstat -ano | Out-File (Join-Path $BaseDir "04_Netstat_Active.txt") -Encoding UTF8
-        ipconfig /displaydns | Out-File (Join-Path $BaseDir "04_DNS_Cache.txt") -Encoding UTF8
-        Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
-            Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort, OwningProcess |
-            Export-Csv (Join-Path $BaseDir "04_NetConnections.csv") -NoTypeInformation -Encoding UTF8
-        $Summary.Add("✅ Network/DNS: OK")
+        # 4.1 Backup bruto do netstat (para referência forense cruzada)
+        netstat -ano | Out-File (Join-Path $BaseDir "04_Netstat_Raw.txt") -Encoding UTF8
+
+        # 4.2 Cache de hashes para evitar reprocessamento do mesmo executável
+        $HashCache = @{}
+
+        # 4.3 Coleta estruturada
+        $NetConns = Get-NetTCPConnection -ErrorAction SilentlyContinue
+        $NetworkReport = foreach ($conn in $NetConns) {
+            $pid = $conn.OwningProcess
+            $proc = $null
+            try { $proc = Get-Process -Id $pid -ErrorAction Stop } catch { $proc = $null }
+
+            $procName = if ($proc) { $proc.ProcessName } else { "Desconhecido(PID:$pid)" }
+            $procPath = if ($proc -and $proc.Path) { $proc.Path } else { "N/A" }
+            $procHash = "N/A"
+
+            if ($procPath -ne "N/A" -and (Test-Path $procPath)) {
+                if ($HashCache.ContainsKey($procPath)) {
+                    $procHash = $HashCache[$procPath]
+                } else {
+                    try {
+                        $procHash = (Get-FileHash -Path $procPath -Algorithm SHA256 -ErrorAction Stop).Hash
+                        $HashCache[$procPath] = $procHash
+                    } catch {
+                        $procHash = "Erro_Acesso/Protegido"
+                        $HashCache[$procPath] = $procHash
+                    }
+                }
+            }
+
+            [PSCustomObject]@{
+                LocalAddress  = $conn.LocalAddress
+                LocalPort     = $conn.LocalPort
+                RemoteAddress = $conn.RemoteAddress
+                RemotePort    = $conn.RemotePort
+                State         = $conn.State
+                PID           = $pid
+                ProcessName   = $procName
+                ProcessPath   = $procPath
+                ProcessSHA256 = $procHash
+            }
+        }
+
+        $NetworkReport | Export-Csv (Join-Path $BaseDir "04_Network_Connections_Enhanced.csv") -NoTypeInformation -Encoding UTF8
+        $Summary.Add("✅ Network/Process/Hash: OK ($($NetworkReport.Count) conexões mapeadas)")
     }
-    catch {
-        Log-Step "ERRO 4/8" "Falha ao coletar rede: $($_.Exception.Message)" -Warn
-        $Summary.Add("⚠️  Network/DNS: Parcial")
-    }
+    catch { Log-Step "ERRO 4/8" "Falha ao coletar rede avançada: $($_.Exception.Message)" -Warn; $Summary.Add("⚠️  Network: Parcial") }
     #endregion
 
     #region 5. Segurança Windows
@@ -184,10 +189,7 @@ try {
         } | Format-List | Out-File (Join-Path $BaseDir "05_SecurityFeatures.txt") -Encoding UTF8
         $Summary.Add("✅ Security Features: OK")
     }
-    catch {
-        Log-Step "ERRO 5/8" "Falha ao verificar segurança: $($_.Exception.Message)" -Warn
-        $Summary.Add("⚠️  Security Features: Parcial")
-    }
+    catch { Log-Step "ERRO 5/8" "Falha ao verificar segurança: $($_.Exception.Message)" -Warn; $Summary.Add("⚠️  Security Features: Parcial") }
     #endregion
 
     #region 6. Persistência
@@ -199,11 +201,9 @@ try {
             "HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce",
             "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
         )
-        
         $Persistence = @()
         foreach ($k in $RunPaths) { 
             if (Test-Path $k) { 
-                # CORREÇÃO: Removido conflito de PSPath
                 $items = Get-ItemProperty -Path $k -ErrorAction SilentlyContinue
                 if ($items) {
                     $Persistence += $items | Select-Object * -ExcludeProperty PSPath, PSParentPath, PSProvider | 
@@ -211,38 +211,20 @@ try {
                 }
             } 
         }
-        
-        if ($Persistence) {
-            $Persistence | Export-Csv (Join-Path $BaseDir "06_Registry_RunKeys.csv") -NoTypeInformation -Encoding UTF8
-        } else {
-            "Nenhuma chave de persistência encontrada" | Out-File (Join-Path $BaseDir "06_Registry_RunKeys.txt") -Encoding UTF8
-        }
+        if ($Persistence) { $Persistence | Export-Csv (Join-Path $BaseDir "06_Registry_RunKeys.csv") -NoTypeInformation -Encoding UTF8 }
+        else { "Nenhuma chave de persistência encontrada" | Out-File (Join-Path $BaseDir "06_Registry_RunKeys.txt") -Encoding UTF8 }
 
-        # Tarefas agendadas relacionadas ao Itaú
         $TasksItau = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {$_.TaskName -match 'Itaú|itau'}
-        if ($TasksItau) {
-            $TasksItau | Select-Object TaskName, State, LastRunTime, NextRunTime | 
-                Export-Csv (Join-Path $BaseDir "06_Tasks_Itau.csv") -NoTypeInformation -Encoding UTF8
-        } else {
-            "Nenhuma tarefa agendada relacionada ao Itaú encontrada" | Out-File (Join-Path $BaseDir "06_Tasks_Itau.txt") -Encoding UTF8
-        }
+        if ($TasksItau) { $TasksItau | Select-Object TaskName, State, LastRunTime, NextRunTime | Export-Csv (Join-Path $BaseDir "06_Tasks_Itau.csv") -NoTypeInformation -Encoding UTF8 }
+        else { "Nenhuma tarefa agendada relacionada ao Itaú encontrada" | Out-File (Join-Path $BaseDir "06_Tasks_Itau.txt") -Encoding UTF8 }
         
-        # Serviços relacionados
         $ServicesItau = Get-Service | Where-Object {$_.DisplayName -match 'Itaú|itau'}
-        if ($ServicesItau) {
-            $ServicesItau | Select-Object Name, DisplayName, Status, StartType | 
-                Export-Csv (Join-Path $BaseDir "06_Services_Itau.csv") -NoTypeInformation -Encoding UTF8
-        } else {
-            "Nenhum serviço relacionado ao Itaú encontrado" | Out-File (Join-Path $BaseDir "06_Services_Itau.txt") -Encoding UTF8
-        }
+        if ($ServicesItau) { $ServicesItau | Select-Object Name, DisplayName, Status, StartType | Export-Csv (Join-Path $BaseDir "06_Services_Itau.csv") -NoTypeInformation -Encoding UTF8 }
+        else { "Nenhum serviço relacionado ao Itaú encontrado" | Out-File (Join-Path $BaseDir "06_Services_Itau.txt") -Encoding UTF8 }
         
         $Summary.Add("✅ Persistence/Run/Tasks/Services: OK")
     }
-    catch {
-        Log-Step "ERRO 6/8" "Falha ao analisar persistência: $($_.Exception.Message)" -Warn
-        "Erro na coleta de persistência: $($_.Exception.Message)" | Out-File (Join-Path $BaseDir "06_ERROR.txt") -Encoding UTF8
-        $Summary.Add("⚠️  Persistence: Parcial (verificar 06_ERROR.txt)")
-    }
+    catch { Log-Step "ERRO 6/8" "Falha ao analisar persistência: $($_.Exception.Message)" -Warn; "Erro na coleta de persistência: $($_.Exception.Message)" | Out-File (Join-Path $BaseDir "06_ERROR.txt") -Encoding UTF8; $Summary.Add("⚠️  Persistence: Parcial (verificar 06_ERROR.txt)") }
     #endregion
 
     #region 7. Relatório
@@ -267,9 +249,7 @@ $(Get-Content (Join-Path $BaseDir "99_Summary.txt") -Raw)
 "@
         $Readme | Out-File (Join-Path $BaseDir "99_README.txt") -Encoding UTF8
     }
-    catch {
-        Log-Step "ERRO 7/8" "Falha ao gerar relatório: $($_.Exception.Message)" -Warn
-    }
+    catch { Log-Step "ERRO 7/8" "Falha ao gerar relatório: $($_.Exception.Message)" -Warn }
     #endregion
 
     #region 8. Compactação
@@ -279,16 +259,13 @@ $(Get-Content (Join-Path $BaseDir "99_Summary.txt") -Raw)
         Compress-Archive -Path "$BaseDir\*" -DestinationPath $ZipPath -Force -ErrorAction Stop
         $ZipHash = (Get-FileHash $ZipPath -Algorithm SHA256).Hash
         Log-Step "FINAL" "Coleta concluída." -Success
-        Write-Host "`n📦 ZIP: $ZipPath" -ForegroundColor Magenta
+        Write-Host "`n ZIP: $ZipPath" -ForegroundColor Magenta
         Write-Host "🔐 SHA256: $ZipHash" -ForegroundColor Yellow
         Write-Host "⚠️  ENVIE A SENHA POR CANAL SEPARADO. NUNCA INCLUA CREDENCIAIS NOS ANEXOS." -ForegroundColor Red
 
         if (-not $RetainUnpacked) { Remove-Item -Path $BaseDir -Recurse -Force }
     }
-    catch {
-        Log-Step "ERRO 8/8" "Falha ao compactar: $($_.Exception.Message)" -Error
-        Write-Host "`n⚠️  Os arquivos permanecem em: $BaseDir" -ForegroundColor Yellow
-    }
+    catch { Log-Step "ERRO 8/8" "Falha ao compactar: $($_.Exception.Message)" -Error; Write-Host "`n️  Os arquivos permanecem em: $BaseDir" -ForegroundColor Yellow }
     #endregion
 }
 catch {
