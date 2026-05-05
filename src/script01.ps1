@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Coleta automatizada de evidências forenses para estações Windows 10/11 sinalizadas pelo Banco Itaú.
 .DESCRIPTION
