@@ -14,8 +14,8 @@
     Período (em horas) para filtrar logs do Windows. Padrão: 72
 .NOTES
     Autor   : [Seu Nome/Handle GitHub]
-    Versão  : 1.0.2 (Rede avançada: Processos + Caminhos + Hashes SHA256)
-    Data    : 2026-05-06
+    Versão  : 1.1.0 (Prefetch + MRU + Drivers + Processos Suspeitos + RI)
+    Data    : 2026-05-05
     Licença : MIT
     AVISO   : FERRAMENTA DE USO EXCLUSIVO EM AMBIENTES CORPORATIVOS AUTORIZADOS.
               NÃO COLETA SENHAS, TOKENS, CREDENCIAIS OU DADOS PESSOAIS SENSÍVEIS.
@@ -45,7 +45,9 @@ if ($WinVer -lt 10) { Write-Warning "Script otimizado para Windows 10/11. Result
 
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $BaseDir = if ($OutputPath) { $OutputPath } else { Join-Path $env:TEMP "Itau_Forensics_$Timestamp" }
-New-Item -Path $BaseDir -ItemType Directory -Force | Out-Null
+if (-not (Test-Path $BaseDir)) {
+    New-Item -Path $BaseDir -ItemType Directory -Force | Out-Null
+}
 
 $LogFile = Join-Path $BaseDir "execution.log"
 $Summary = [System.Collections.Generic.List[string]]::new()
@@ -62,7 +64,7 @@ function Log-Step {
 
 try {
     #region 1. Informações do Sistema
-    Log-Step "1/8" "Coletando dados do sistema..."
+    Log-Step "1/11" "Coletando dados do sistema..."
     try {
         systeminfo | Out-File (Join-Path $BaseDir "01_SystemInfo.txt") -Encoding UTF8
         Get-ComputerInfo | Select-Object WindowsProductName, OsVersion, OsBuildNumber, CsName, CsDomain, OsArchitecture |
@@ -73,7 +75,7 @@ try {
     #endregion
 
     #region 2. App Itaú
-    Log-Step "2/8" "Mapeando artefatos do App Itaú..."
+    Log-Step "2/11" "Mapeando artefatos do App Itaú..."
     try {
         $ItauReport = @()
         $SearchPaths = @("$env:ProgramFiles\Itaú", "${env:ProgramFiles(x86)}\Itaú", "$env:LOCALAPPDATA\Itaú", "$env:APPDATA\Itaú")
@@ -103,7 +105,7 @@ try {
     #endregion
 
     #region 3. Logs Windows
-    Log-Step "3/8" "Exportando logs (últimas $($HoursBack)h)..."
+    Log-Step "3/11" "Exportando logs (últimas $($HoursBack)h)..."
     try {
         $Since = (Get-Date).AddHours(-$HoursBack)
         Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=$Since} -MaxEvents 3000 -ErrorAction SilentlyContinue |
@@ -111,16 +113,22 @@ try {
             Select-Object TimeCreated, Id, ProviderName, LevelDisplayName, Message |
             Export-Csv (Join-Path $BaseDir "03_WinEvents_Itau.csv") -NoTypeInformation -Encoding UTF8
 
-        Get-WinEvent -FilterHashtable @{LogName='Security'; StartTime=$Since; ID=4624,4625,4688,4104} -MaxEvents 1500 -ErrorAction SilentlyContinue |
+        # Eventos Security expandidos
+        Get-WinEvent -FilterHashtable @{LogName='Security'; StartTime=$Since; ID=4624,4625,4627,4672,4688,4104,4656,4663,1102} -MaxEvents 2000 -ErrorAction SilentlyContinue |
             Select-Object TimeCreated, Id, Message |
             Export-Csv (Join-Path $BaseDir "03_WinEvents_Security.csv") -NoTypeInformation -Encoding UTF8
-        $Summary.Add("✅ Windows Events: OK")
+
+        # Eventos PowerShell
+        Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-PowerShell/Operational'; StartTime=$Since; ID=4103,4104} -MaxEvents 1000 -ErrorAction SilentlyContinue |
+            Select-Object TimeCreated, Id, Message |
+            Export-Csv (Join-Path $BaseDir "03_WinEvents_PowerShell.csv") -NoTypeInformation -Encoding UTF8
+        $Summary.Add("✅ Windows Events: OK (Security + PowerShell)")
     }
-    catch { Log-Step "ERRO 3/8" "Falha ao exportar logs: $($_.Exception.Message)" -Warn; $Summary.Add("⚠️  Windows Events: Parcial") }
+    catch { Log-Step "ERRO 3/11" "Falha ao exportar logs: $($_.Exception.Message)" -Warn; $Summary.Add("⚠️  Windows Events: Parcial") }
     #endregion
 
     #region 4. Rede Avançada (Processos + Caminhos + Hashes)
-    Log-Step "4/8" "Coletando conexões de rede com processos, caminhos e hashes SHA256..."
+    Log-Step "4/11" "Coletando conexões de rede com processos, caminhos e hashes SHA256..."
     try {
         # 4.1 Backup bruto do netstat (para referência forense cruzada)
         netstat -ano | Out-File (Join-Path $BaseDir "04_Netstat_Raw.txt") -Encoding UTF8
@@ -131,11 +139,11 @@ try {
         # 4.3 Coleta estruturada
         $NetConns = Get-NetTCPConnection -ErrorAction SilentlyContinue
         $NetworkReport = foreach ($conn in $NetConns) {
-            $pid = $conn.OwningProcess
+            $procId = $conn.OwningProcess
             $proc = $null
-            try { $proc = Get-Process -Id $pid -ErrorAction Stop } catch { $proc = $null }
+            try { $proc = Get-Process -Id $procId -ErrorAction Stop } catch { $proc = $null }
 
-            $procName = if ($proc) { $proc.ProcessName } else { "Desconhecido(PID:$pid)" }
+            $procName = if ($proc) { $proc.ProcessName } else { "Desconhecido(PID:$procId)" }
             $procPath = if ($proc -and $proc.Path) { $proc.Path } else { "N/A" }
             $procHash = "N/A"
 
@@ -159,7 +167,7 @@ try {
                 RemoteAddress = $conn.RemoteAddress
                 RemotePort    = $conn.RemotePort
                 State         = $conn.State
-                PID           = $pid
+                PID           = $procId
                 ProcessName   = $procName
                 ProcessPath   = $procPath
                 ProcessSHA256 = $procHash
@@ -173,7 +181,7 @@ try {
     #endregion
 
     #region 5. Segurança Windows
-    Log-Step "5/8" "Verificando recursos de proteção..."
+    Log-Step "5/11" "Verificando recursos de proteção..."
     try {
         $Mp = Get-MpComputerStatus -ErrorAction SilentlyContinue
         $VBS = Get-CimInstance Win32_DeviceGuard -Namespace "root\Microsoft\Windows\DeviceGuard" -ErrorAction SilentlyContinue
@@ -193,7 +201,7 @@ try {
     #endregion
 
     #region 6. Persistência
-    Log-Step "6/8" "Analisando pontos de persistência..."
+    Log-Step "6/11" "Analisando pontos de persistência..."
     try {
         $RunPaths = @(
             "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
@@ -202,14 +210,21 @@ try {
             "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
         )
         $Persistence = @()
-        foreach ($k in $RunPaths) { 
-            if (Test-Path $k) { 
+        foreach ($k in $RunPaths) {
+            if (Test-Path $k) {
                 $items = Get-ItemProperty -Path $k -ErrorAction SilentlyContinue
                 if ($items) {
-                    $Persistence += $items | Select-Object * -ExcludeProperty PSPath, PSParentPath, PSProvider | 
-                        Add-Member -MemberType NoteProperty -Name "RegistryPath" -Value $k -PassThru
+                    $props = $items.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' }
+                    foreach ($prop in $props) {
+                        $Persistence += [PSCustomObject]@{
+                            RegistryPath = $k
+                            Name        = $prop.Name
+                            Value       = $prop.Value
+                            Type        = if ($prop.TypeNameOfValue) { $prop.TypeNameOfValue.Split('.')[-1] } else { "String" }
+                        }
+                    }
                 }
-            } 
+            }
         }
         if ($Persistence) { $Persistence | Export-Csv (Join-Path $BaseDir "06_Registry_RunKeys.csv") -NoTypeInformation -Encoding UTF8 }
         else { "Nenhuma chave de persistência encontrada" | Out-File (Join-Path $BaseDir "06_Registry_RunKeys.txt") -Encoding UTF8 }
@@ -224,11 +239,200 @@ try {
         
         $Summary.Add("✅ Persistence/Run/Tasks/Services: OK")
     }
-    catch { Log-Step "ERRO 6/8" "Falha ao analisar persistência: $($_.Exception.Message)" -Warn; "Erro na coleta de persistência: $($_.Exception.Message)" | Out-File (Join-Path $BaseDir "06_ERROR.txt") -Encoding UTF8; $Summary.Add("⚠️  Persistence: Parcial (verificar 06_ERROR.txt)") }
+    catch { Log-Step "ERRO 6/11" "Falha ao analisar persistência: $($_.Exception.Message)" -Warn; "Erro na coleta de persistência: $($_.Exception.Message)" | Out-File (Join-Path $BaseDir "06_ERROR.txt") -Encoding UTF8; $Summary.Add("⚠️  Persistence: Parcial (verificar 06_ERROR.txt)") }
     #endregion
 
-    #region 7. Relatório
-    Log-Step "7/8" "Gerando resumo executivo..."
+    #region 7. Prefetch
+    Log-Step "7/11" "Analisando artefatos Prefetch..."
+    try {
+        $PrefetchPath = "$env:SystemRoot\Prefetch"
+        if (Test-Path $PrefetchPath) {
+            $PrefetchFiles = Get-ChildItem -Path $PrefetchPath -Filter "*.pf" -ErrorAction SilentlyContinue |
+                Select-Object Name, LastWriteTime, Length |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 100
+            $PrefetchFiles | Export-Csv (Join-Path $BaseDir "07_Prefetch.csv") -NoTypeInformation -Encoding UTF8
+            $Summary.Add("✅ Prefetch: $($PrefetchFiles.Count) arquivos")
+        } else {
+            "Prefetch não disponível" | Out-File (Join-Path $BaseDir "07_Prefetch.txt") -Encoding UTF8
+            $Summary.Add("⚠️  Prefetch: Indisponível")
+        }
+    }
+    catch { Log-Step "ERRO 7/11" "Falha ao analisar Prefetch: $($_.Exception.Message)" -Warn; $Summary.Add("⚠️  Prefetch: Parcial") }
+    #endregion
+
+    #region 8. MRU e JumpList
+    Log-Step "8/11" "Coletando MRU e JumpList..."
+    try {
+        $MruReport = @()
+
+        # JumpList do App Itaú
+        $JumpListPaths = @(
+            "$env:APPDATA\Microsoft\Windows\Recent\AutomaticDestinations",
+            "$env:APPDATA\Microsoft\Windows\Recent\CustomDestinations"
+        )
+        foreach ($jl in $JumpListPaths) {
+            if (Test-Path $jl) {
+                $jlFiles = Get-ChildItem -Path $jl -Filter "*.automaticDestinations-ms" -ErrorAction SilentlyContinue
+                foreach ($f in $jlFiles) {
+                    $MruReport += [PSCustomObject]@{ Type="JumpList"; Path=$f.FullName; Modified=$f.LastWriteTime; Size=$f.Length }
+                }
+            }
+        }
+
+        # Recent Docs
+        $RecentPath = "$env:APPDATA\Microsoft\Windows\Recent"
+        if (Test-Path $RecentPath) {
+            $RecentDocs = Get-ChildItem -Path $RecentPath -Filter "*Itau*" -ErrorAction SilentlyContinue |
+                Select-Object Name, LastWriteTime, Length | Sort-Object LastWriteTime -Descending
+            foreach ($rd in $RecentDocs) {
+                $MruReport += [PSCustomObject]@{ Type="RecentDoc"; Path=$rd.Name; Modified=$rd.LastWriteTime; Size=$rd.Length }
+            }
+        }
+
+        if ($MruReport) {
+            $MruReport | Export-Csv (Join-Path $BaseDir "08_MRU_JumpList.csv") -NoTypeInformation -Encoding UTF8
+            $Summary.Add("✅ MRU/JumpList: $($MruReport.Count) itens")
+        } else {
+            "Nenhum MRU/JumpList relacionado encontrado" | Out-File (Join-Path $BaseDir "08_MRU_JumpList.txt") -Encoding UTF8
+            $Summary.Add("⚠️  MRU/JumpList: Nenhum achado")
+        }
+    }
+    catch { Log-Step "ERRO 8/11" "Falha ao coletar MRU: $($_.Exception.Message)" -Warn; $Summary.Add("⚠️  MRU: Parcial") }
+    #endregion
+
+    #region 9. Drivers Carregados
+    Log-Step "9/11" "Analisando drivers carregados..."
+    try {
+        $Drivers = Get-Process -Module -ErrorAction SilentlyContinue | Where-Object { $_.ModuleName -match '\.sys$' }
+        $DriverReport = @()
+        $DriverHashCache = @{}
+        foreach ($drv in $Drivers) {
+            $path = if ($drv.FileName) { $drv.FileName } else { "N/A" }
+            $hash = "N/A"
+            if ($path -ne "N/A" -and (Test-Path $path)) {
+                if ($DriverHashCache.ContainsKey($path)) {
+                    $hash = $DriverHashCache[$path]
+                } else {
+                    try { $hash = (Get-FileHash -Path $path -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash } catch { }
+                    $DriverHashCache[$path] = $hash
+                }
+            }
+            $sig = $null
+            try { $sig = Get-AuthenticodeSignature -FilePath $path -ErrorAction SilentlyContinue } catch { }
+            $DriverReport += [PSCustomObject]@{
+                ModuleName = $drv.ModuleName
+                FilePath  = $path
+                SHA256    = $hash
+                Signed    = if ($sig.Status) { $sig.Status.ToString() } else { "Unknown" }
+            }
+        }
+        $DriverReport | Export-Csv (Join-Path $BaseDir "09_Drivers.csv") -NoTypeInformation -Encoding UTF8
+        $Unsigned = $DriverReport | Where-Object { $_.Signed -ne "Valid" }
+        $Summary.Add("✅ Drivers: $($DriverReport.Count) carregados, $($Unsigned.Count) não assinados")
+    }
+    catch { Log-Step "ERRO 9/11" "Falha ao analisar drivers: $($_.Exception.Message)" -Warn; $Summary.Add("⚠️  Drivers: Parcial") }
+    #endregion
+
+    #region 10. Processos Suspeitos
+    Log-Step "10/11" "Detectando processos suspeitos..."
+    try {
+        $ProcReport = @()
+        $AllProcs = Get-Process -ErrorAction SilentlyContinue
+        $SuspiciousPaths = @('\Temp\', '\Downloads\', '\AppData\Local\Temp\', '$env:TEMP')
+        $SuspiciousPPIDs = @(0, 4) # System e Idle
+
+        foreach ($p in $AllProcs) {
+            $suspicious = $false
+            $reasons = @()
+
+            # Verificar caminho anômalo
+            if ($p.Path) {
+                foreach ($sp in $SuspiciousPaths) {
+                    if ($p.Path -match [regex]::Escape($sp)) {
+                        $suspicious = $true
+                        $reasons += "Caminho_anômalo"
+                        break
+                    }
+                }
+            }
+
+            # Verificar PPID suspeito
+            try {
+                $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($p.Id)" -ErrorAction SilentlyContinue
+                if ($parent -and $parent.ParentProcessId -in $SuspiciousPPIDs) {
+                    $suspicious = $true
+                    $reasons += "PPID_suspeito"
+                }
+            } catch { }
+
+            if ($suspicious) {
+                $ProcReport += [PSCustomObject]@{
+                    PID        = $p.Id
+                    Name       = $p.ProcessName
+                    Path       = $p.Path
+                    PPID       = if ($parent) { $parent.ParentProcessId } else { "N/A" }
+                    Reasons    = ($reasons -join ", ")
+                    StartTime  = $p.StartTime
+                }
+            }
+        }
+
+        if ($ProcReport) {
+            $ProcReport | Export-Csv (Join-Path $BaseDir "10_SuspiciousProcesses.csv") -NoTypeInformation -Encoding UTF8
+            $Summary.Add("⚠️  Processos Suspeitos: $($ProcReport.Count) detectados")
+        } else {
+            "Nenhum processo suspeito detectado" | Out-File (Join-Path $BaseDir "10_SuspiciousProcesses.txt") -Encoding UTF8
+            $Summary.Add("✅ Processos Suspeitos: Nenhum achado")
+        }
+    }
+    catch { Log-Step "ERRO 10/11" "Falha ao detectar processos: $($_.Exception.Message)" -Warn; $Summary.Add("⚠️  Processos: Parcial") }
+    #endregion
+
+    #region 11. Resposta a Incidentes (Triagem)
+    Log-Step "11/11" "Triagem de indicadores de comprometimento..."
+    try {
+        $IRReport = @()
+
+        # Conexões suspeitas (portas incomuns ou sinais de C2)
+        $SuspiciousPorts = @(4444, 5555, 6666, 7777, 8888, 31337, 1337)
+        $NetTCP = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue
+        foreach ($conn in $NetTCP) {
+            if ($conn.LocalPort -in $SuspiciousPorts -or $conn.LocalPort -gt 10000) {
+                $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+                $IRReport += [PSCustomObject]@{
+                    Type     = "Porta_Anômala"
+                    Detail   = "Porta $($conn.LocalPort) em listen"
+                    Process  = if ($proc) { $proc.ProcessName } else { "PID:$($conn.OwningProcess)" }
+                    Severity = "Alta"
+                }
+            }
+        }
+
+        # DNS queries suspeitas (simplificado - apenas listar)
+        $DnsQueries = Get-DnsClientCache -ErrorAction SilentlyContinue | Select-Object -First 50
+        $SuspiciousDomains = $DnsQueries | Where-Object { $_.Entry -match '(itau|bank|secure|login).*\.exe|\.xyz|\.top|\.click' }
+        foreach ($d in $SuspiciousDomains) {
+            $IRReport += [PSCustomObject]@{
+                Type     = "DNS_Suspeito"
+                Detail   = $d.Entry
+                Process  = "N/A"
+                Severity = "Média"
+            }
+        }
+
+        if ($IRReport) {
+            $IRReport | Export-Csv (Join-Path $BaseDir "11_IR_Triage.csv") -NoTypeInformation -Encoding UTF8
+            $Summary.Add("⚠️  Triagem IR: $($IRReport.Count) indicadores")
+        } else {
+            "Nenhum indicador de comprometimento detectado" | Out-File (Join-Path $BaseDir "11_IR_Triage.txt") -Encoding UTF8
+            $Summary.Add("✅ Triagem IR: Limpo")
+        }
+    }
+    catch { Log-Step "ERRO 11/11" "Falha na triagem IR: $($_.Exception.Message)" -Warn; $Summary.Add("⚠️  Triagem IR: Parcial") }
+    #endregion
+
+    #region 12. Relatório
+    Log-Step "12/11" "Gerando resumo executivo..."
     try {
         $Summary | Out-File (Join-Path $BaseDir "99_Summary.txt") -Encoding UTF8
         $Readme = @"
@@ -249,11 +453,11 @@ $(Get-Content (Join-Path $BaseDir "99_Summary.txt") -Raw)
 "@
         $Readme | Out-File (Join-Path $BaseDir "99_README.txt") -Encoding UTF8
     }
-    catch { Log-Step "ERRO 7/8" "Falha ao gerar relatório: $($_.Exception.Message)" -Warn }
+    catch { Log-Step "ERRO 12/11" "Falha ao gerar relatório: $($_.Exception.Message)" -Warn }
     #endregion
 
-    #region 8. Compactação
-    Log-Step "8/8" "Compactando evidências..."
+    #region 13. Compactação
+    Log-Step "13/11" "Compactando evidências..."
     try {
         $ZipPath = "$BaseDir.zip"
         Compress-Archive -Path "$BaseDir\*" -DestinationPath $ZipPath -Force -ErrorAction Stop
@@ -265,7 +469,7 @@ $(Get-Content (Join-Path $BaseDir "99_Summary.txt") -Raw)
 
         if (-not $RetainUnpacked) { Remove-Item -Path $BaseDir -Recurse -Force }
     }
-    catch { Log-Step "ERRO 8/8" "Falha ao compactar: $($_.Exception.Message)" -Error; Write-Host "`n️  Os arquivos permanecem em: $BaseDir" -ForegroundColor Yellow }
+    catch { Log-Step "ERRO 13/11" "Falha ao compactar: $($_.Exception.Message)" -Error; Write-Host "`n️  Os arquivos permanecem em: $BaseDir" -ForegroundColor Yellow }
     #endregion
 }
 catch {
